@@ -1,0 +1,383 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+// Types
+type NetworkName string
+
+const (
+	Mainnet  NetworkName = "mainnet"
+	Testnet  NetworkName = "testnet"
+	Devnet   NetworkName = "devnet"
+	Localnet NetworkName = "localnet"
+)
+
+type NetworkConfig struct {
+	URL           string
+	SuiNsEndpoint string
+	ChainID       string
+}
+
+type Balance struct {
+	CoinType     string `json:"coinType"`
+	TotalBalance string `json:"totalBalance"`
+}
+
+type SuiNameResponse struct {
+	Address string `json:"address,omitempty"`
+	Name    string `json:"name,omitempty"`
+}
+
+type AccountObjectResponse struct {
+	Data   interface{} `json:"data"`
+	Error  interface{} `json:"error,omitempty"`
+}
+
+// Network configuration
+var networks = map[NetworkName]NetworkConfig{
+	Mainnet: {
+		URL:           "https://fullnode.mainnet.sui.io:443",
+		SuiNsEndpoint: "https://api.suins.io/mainnet",
+		ChainID:       "0x1",
+	},
+	Testnet: {
+		URL:           "https://fullnode.testnet.sui.io:443",
+		SuiNsEndpoint: "https://api.suins.io/testnet",
+		ChainID:       "0x2",
+	},
+	Devnet: {
+		URL:           "https://fullnode.devnet.sui.io:443",
+		SuiNsEndpoint: "https://api.suins.io/devnet",
+		ChainID:       "0x3",
+	},
+	Localnet: {
+		URL:           "http://127.0.0.1:9000",
+		SuiNsEndpoint: "http://localhost:3000/api",
+		ChainID:       "0x4",
+	},
+}
+
+// HTTP client with timeout
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+// Spinner-like progress indicator
+func showProgress(msg string) {
+	fmt.Printf("⏳ %s\n", msg)
+}
+
+func showSuccess(msg string) {
+	green := color.New(color.FgGreen)
+	green.Printf("✓ %s\n", msg)
+}
+
+func showError(msg string) {
+	red := color.New(color.FgRed)
+	red.Printf("✗ %s\n", msg)
+}
+
+// SUI JSON-RPC client
+func suiRPCCall(ctx context.Context, rpcURL, method string, params []interface{}) (json.RawMessage, error) {
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  method,
+		"params":  params,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", rpcURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Result json.RawMessage `json:"result"`
+		Error  interface{}     `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.Error != nil {
+		return nil, fmt.Errorf("RPC error: %v", result.Error)
+	}
+
+	return result.Result, nil
+}
+
+// Get all balances for an address
+func getAllBalances(ctx context.Context, rpcURL, owner string) ([]Balance, error) {
+	result, err := suiRPCCall(ctx, rpcURL, "suix_getAllBalances", []interface{}{owner})
+	if err != nil {
+		return nil, err
+	}
+
+	var balances []Balance
+	if err := json.Unmarshal(result, &balances); err != nil {
+		return nil, err
+	}
+
+	return balances, nil
+}
+
+// Get object information
+func getObject(ctx context.Context, rpcURL, objectID string) (interface{}, error) {
+	params := []interface{}{
+		objectID,
+		map[string]bool{
+			"showContent": true,
+			"showDisplay": true,
+			"showOwner":   true,
+		},
+	}
+
+	result, err := suiRPCCall(ctx, rpcURL, "sui_getObject", params)
+	if err != nil {
+		return nil, err
+	}
+
+	var obj interface{}
+	if err := json.Unmarshal(result, &obj); err != nil {
+		return nil, err
+	}
+
+	return obj, nil
+}
+
+// Resolve SuiNS name
+func resolveSuiName(ctx context.Context, name string, network NetworkName) (string, error) {
+	config := networks[network]
+	encodedName := url.QueryEscape(name)
+	apiURL := fmt.Sprintf("%s/resolve?name=%s", config.SuiNsEndpoint, encodedName)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var suiResp SuiNameResponse
+	if err := json.NewDecoder(resp.Body).Decode(&suiResp); err != nil {
+		return "", err
+	}
+
+	if suiResp.Address == "" {
+		return "", fmt.Errorf("no address returned for name: %s", name)
+	}
+
+	return suiResp.Address, nil
+}
+
+// Resolve SuiNS name on all networks
+func resolveSuiNameOnAllNetworks(ctx context.Context, name string) (string, error) {
+	networksToCheck := []NetworkName{Mainnet, Testnet, Devnet, Localnet}
+
+	for _, network := range networksToCheck {
+		address, err := resolveSuiName(ctx, name, network)
+		if err == nil && address != "" {
+			return address, nil
+		}
+	}
+
+	return "", fmt.Errorf("SuiNS name %q not found on any network", name)
+}
+
+// Check for SuiNS reverse lookup
+func checkForSuiNsName(ctx context.Context, address string, network NetworkName) (string, error) {
+	config := networks[network]
+	apiURL := fmt.Sprintf("%s/reverse-lookup?address=%s", config.SuiNsEndpoint, address)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var suiResp SuiNameResponse
+	if err := json.NewDecoder(resp.Body).Decode(&suiResp); err != nil {
+		return "", err
+	}
+
+	return suiResp.Name, nil
+}
+
+// Detect network for address
+func detectNetworkForAddress(ctx context.Context, address string) (NetworkName, string, error) {
+	networksToCheck := []NetworkName{Mainnet, Testnet, Devnet}
+
+	for _, network := range networksToCheck {
+		config := networks[network]
+		balances, err := getAllBalances(ctx, config.URL, address)
+		if err == nil && len(balances) > 0 {
+			return network, config.URL, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("address not found on any supported network")
+}
+
+// Main command handler
+func getAccountInfo(cmd *cobra.Command, args []string) error {
+	ctx := context.Background()
+	identifier := args[0]
+
+	showProgress("Detecting account information...")
+
+	address := identifier
+	isSuiNsName := strings.Contains(identifier, ".sui")
+
+	// Resolve SuiNS name if needed
+	if isSuiNsName {
+		showProgress(fmt.Sprintf("Resolving SuiNS name: %s", identifier))
+		resolvedAddr, err := resolveSuiNameOnAllNetworks(ctx, identifier)
+		if err != nil {
+			showError(err.Error())
+			return err
+		}
+		address = resolvedAddr
+		showProgress(fmt.Sprintf("Resolved %s to %s", identifier, address))
+	}
+
+	// Detect network
+	network, rpcURL, err := detectNetworkForAddress(ctx, address)
+	if err != nil {
+		showError(err.Error())
+		return err
+	}
+
+	showProgress(fmt.Sprintf("Found account on %s network", network))
+
+	// Fetch data concurrently
+	type result struct {
+		accountInfo interface{}
+		balances    []Balance
+		reverseName string
+		err         error
+	}
+
+	resultChan := make(chan result, 1)
+
+	go func() {
+		var r result
+		// Get account info
+		r.accountInfo, r.err = getObject(ctx, rpcURL, address)
+		if r.err != nil {
+			resultChan <- r
+			return
+		}
+
+		// Get balances
+		r.balances, r.err = getAllBalances(ctx, rpcURL, address)
+		if r.err != nil {
+			resultChan <- r
+			return
+		}
+
+		// Reverse lookup
+		if isSuiNsName {
+			r.reverseName = identifier
+		} else {
+			r.reverseName, _ = checkForSuiNsName(ctx, address, network)
+		}
+
+		resultChan <- r
+	}()
+
+	res := <-resultChan
+	if res.err != nil {
+		showError(res.err.Error())
+		return res.err
+	}
+
+	showSuccess(fmt.Sprintf("Account information retrieved for %s", address))
+
+	// Display results
+	blue := color.New(color.FgBlue, color.Bold)
+	bold := color.New(color.Bold)
+	green := color.New(color.FgGreen)
+
+	fmt.Println()
+	blue.Print("Network: ")
+	green.Println(network)
+	bold.Printf("Address: %s\n", address)
+
+	if res.reverseName != "" {
+		bold.Printf("SuiNS Name: %s\n", res.reverseName)
+	}
+
+	fmt.Println()
+	blue.Println("Balances:")
+	if len(res.balances) == 0 {
+		fmt.Println("No coins found")
+	} else {
+		for _, b := range res.balances {
+			bold.Printf("%s: ", b.CoinType)
+			fmt.Println(b.TotalBalance)
+		}
+	}
+
+	fmt.Println()
+	blue.Println("Account Object:")
+	accountJSON, _ := json.MarshalIndent(res.accountInfo, "", "  ")
+	fmt.Println(string(accountJSON))
+
+	return nil
+}
+
+func main() {
+	rootCmd := &cobra.Command{
+		Use:     "kaizen",
+		Short:   "A smart Sui blockchain CLI that auto-detects networks",
+		Version: "1.0.0",
+	}
+
+	getAccountInfoCmd := &cobra.Command{
+		Use:   "getAccountInfo [identifier]",
+		Short: "Get account information (auto-detects network)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  getAccountInfo,
+	}
+
+	rootCmd.AddCommand(getAccountInfoCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
